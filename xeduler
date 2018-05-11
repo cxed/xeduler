@@ -1,0 +1,200 @@
+#!/bin/bash
+# xeduler - Chris X Edwards - Dec 14, 2005
+# Xeduler is a simple job scheduler. It is designed to have no exotic
+# dependencies, be very small, not waste CPU resources, be completely
+# comprehensible, be simple to configure, leverage existing user
+# expertise for interfacing, be freely available, and
+# publicly-licensed.
+
+# You are free to use and redistribute this software under the terms
+# of the GNU GPL. 
+
+# These directories define where the queue and resource list live.
+# You can reassign their locations to be where ever they are convenient.
+Qdir="/var/xeduler/QUEUE/"
+Rdir="/var/xeduler/RESOURCES/"
+
+# Where Xeduler records interesting actvity.
+XEDULER_LOG="$Rdir/.xeduler-log"
+
+# Waiting file name. This file helps Xeduler know when it's waiting.
+# It's not for humans to actually do anything with or worry about.
+WAITING=".xeduler-waiting"
+
+# Prefixes - Customize them if you like.
+DOWN="DOWN--" # Resource status prefix - Resource is down.
+STOP="STOP--" # Resource status prefix - Resource needs to be down.
+FREE="FREE--" # Resource status prefix - Resource is free.
+BUSY="BUSY--" # Resource status prefix - Resource is captured.
+JOB="JOB--"   # Job prefix - defines jobs in the queue.
+
+function XedulerLogEntry {
+    # This function makes a consistently formatted entry in the
+    # Xeduler activity log.
+    echo -n "----------" >> $XEDULER_LOG
+    date >> $XEDULER_LOG
+    echo $1 >> $XEDULER_LOG
+} # End function XedulerLogEntry.
+
+function RemoveFirstLineFromFile {
+    # This function is used to extract jobs out of batch job files
+    # line by line.
+    echo $'1d\nw' | /bin/ed $1 2>/dev/null # /bin/ed deletes 1st line.
+    if [ ! -s $1 ]; then # If file now has size zero...
+        /bin/rm $1 # ...file is empty, get rid of it completely.
+    fi # End if file was completely emptied.
+} # End function RemoveFirstLineFromFile.
+
+function CheckForJobsPending {
+    # First check to see if there are any job files...
+    if /bin/ls $Qdir/$JOB* >/dev/null 2>&1; then
+        #First file in list will be looked at. Global.
+        CURRENTJOBFILE=`/bin/ls $Qdir/$JOB* | /bin/head -n1`
+        #First line in that file will be the job to run. Global.
+        CURRENTJOBLINE=`/bin/head -n1 $CURRENTJOBFILE`
+        # Now this job is stored, delete from file in queue.
+        RemoveFirstLineFromFile $CURRENTJOBFILE
+    else  # If no job files ready, then fail.
+        /bin/false
+    fi # End if there are job files.
+} # End function CheckForJobsPending.
+
+function HibernateUntilResourceIsFree {
+    # Only bother hibernating if there are BUSY resources deployed
+    # that will be able to wake the Xeduler up again.
+    if CheckForBusyResources; then
+        # Drop a clue into the resource directory that it's waiting.
+        /bin/touch $Rdir/$WAITING.$$
+        # Suspend the Xeduler's process while there are no free resources.
+        # It will get woken back up again once a previously dispatched job
+        # subscript finishes its job and checks for the "waiting" clue.
+        kill -SIGSTOP $$  # Good night.
+    else # No free resources and no busy jobs- must all be offline.
+        while ! ResourcesAvailable; do # Nothing can be done, so...
+            /bin/sleep 1 #...just wait here until a resource comes back.
+        done # End loop to wait for resources to return.
+    fi # End checking if there are BUSY resources working.
+} # End function HibernateUntilResourceIsFree.
+
+function ResourcesAvailable {
+    # This is easily accomplished simply by listing a glob (FREE*) of
+    # what the program hopes to find. If this command finds something,
+    # then exit code is true, but if not, then function returns false.
+    /bin/ls $Rdir/$FREE* >/dev/null 2>&1
+} # End function ResourcesUnavailable.
+
+function DispatchThisJobNow {
+    local JOB2RUN=$1 # First and only input parameter.
+    # Complete path of a free resource.
+    local F=`/bin/ls $Rdir/$FREE* | /bin/head -n1`
+    # Just the filename, no path of the chosen free resource.
+    local AFREERESOURCEFN=`/bin/basename $F`
+    # Without the prefix.
+    local RESOURCEBASE=${AFREERESOURCEFN##$FREE}
+    # BUSY instead of FREE.
+    local B=$Rdir/$BUSY$RESOURCEBASE
+    # Strip off any extra info like vls12-cpu2, to just raven12
+    local MACHINE=${RESOURCEBASE%%-*} # Machine to run on. 
+    mv $F $B # Change resource from free to busy.
+    # Prepare a way to wake up a hibernating system once the job is
+    # finished and it frees up its resource. This little script will
+    # be run as an independent child process. It will actually fire
+    # off the user's desired job and wait for it. When the user's
+    # desired job has completed, this subprocess script will check to
+    # see if the Xeduler is waiting for a resource to free up. If that
+    # is true, then this is the time a resource just became free and
+    # the sub script wakes up its parent who moves on to the next job,
+    # and then the sub process script is finished.
+    # 
+    # The following heredoc script assumes you are able to execute
+    # remote jobs with ssh (see the line that says /usr/bin/ssh). If
+    # this is not how you want to run jobs, then fix that line.
+/bin/cat <<THEEND > $B
+#!/bin/bash
+#TESTING ONLY--- echo I\'m subprocess \$\$ and I\'m running a job on $MACHINE'!'
+#TESTING ONLY--- echo JOB: $JOB2RUN
+/usr/bin/ssh $MACHINE $JOB2RUN
+##TESTING ONLY--- ./test_job.py $RESOURCEBASE $JOB2RUN >> output
+/bin/mv $B $F
+if /bin/rm $Rdir/$WAITING.$$ >/dev/null 2>&1; then
+    /bin/kill -SIGCONT $$
+fi
+#/bin/true > $F
+THEEND
+    /bin/bash $B & # Run this in bg and move along.
+} # End function DispatchThisJobNow.
+
+function HandleANewJob {
+    if ! ResourcesAvailable; then
+        # echo "Hibernating..." # DEBUG
+        # ls $Rdir  # DEBUG
+        HibernateUntilResourceIsFree
+    fi
+    # echo "Dispatching...$1" # DEBUG
+    # ls $Rdir # DEBUG
+    DispatchThisJobNow $1
+} # End function HandleANewJob.
+
+function CheckForScheduledShutdown {
+    # Looking for a file named Quit (case-insensitive).
+    /bin/ls $Rdir/[Qq][Uu][Ii][Tt] >/dev/null 2>&1
+} # End function CheckForShutdown.
+
+function CheckForScheduledDowntime {
+    # Same strategy as ResourcesAvailable function.
+    /bin/ls $Rdir/$STOP* >/dev/null 2>&1
+} # End function CheckForScheduledDowntime.
+
+function CheckForBusyResources {
+    # Same strategy as ResourcesAvailable function.
+    /bin/ls $Rdir/$BUSY* >/dev/null 2>&1
+} # End function CheckForBusyResources.
+
+function TakeResourceOffline {
+    # The idea here is that if a user touches a file like
+    # "DOWN.raven19" then there should also be a "FREE.raven19".
+    # This deletes that FREE file thereby disabling this resource. Why
+    # not just have the user rename the thing? That is ok, but this
+    # allows the user to touch the DOWN file and if a job is BUSY, it
+    # will finish what it's doing and then go offline.
+    S=`/bin/ls $Rdir/$STOP* | /bin/head -n1`
+    STOPRESOURCEFN=`/bin/basename $S`
+    RESOURCEBASE=${STOPRESOURCEFN##$STOP}
+    # Figure out the corresponding free resource.
+    F=$Rdir/$FREE$RESOURCEBASE
+    D=$Rdir/$DOWN$RESOURCEBASE
+    # If there is such a FREE file and (double check) a...
+    if [ -e $F ] && [ -e $S ]; then # ...placeholding STOP file...
+        XedulerLogEntry "Taking $RESOURCEBASE offline"
+        /bin/mv $S $D  # ...change STOP to DOWN then...
+        /bin/rm $F     # ...go ahead and just delete FREE.
+    fi # End if threre's a corresponding free resource.
+} # End function TakeResourceOffline.
+
+function CleanupBeforeExiting {
+    # This may not work for a killed Xeduler because I don't know if
+    # the handler will be active on a stopped job.
+    if [ -e $Rdir/$WAITING.$$ ]; then # Is Xeduler waiting for resources?
+        /bin/rm $Rdir/$WAITING.$$          # If someone killed it, obviously not. Clear waiting.
+    fi
+    if [ -e $Rdir/[Qq][Uu][Ii][Tt] ]; then # Is there a quit file lying around?
+        /bin/rm $Rdir/[Qq][Uu][Ii][Tt]          # Don't need that either.
+    fi
+    XedulerLogEntry "Xeduler shut down."
+} # End function CleanupBeforeExiting.
+
+# =================== "Main" =====================
+#trap CleanupBeforeExiting SIGHUP SIGINT
+
+while /bin/true; do
+    if CheckForScheduledShutdown; then
+        CleanupBeforeExiting
+        exit
+    elif CheckForScheduledDowntime; then
+        TakeResourceOffline;
+    elif CheckForJobsPending; then
+        HandleANewJob $CURRENTJOBLINE
+    else
+        /bin/sleep 1 # Relax and wait for jobs to be submitted.
+    fi
+done
